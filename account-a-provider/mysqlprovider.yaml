@@ -1,0 +1,331 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Account A provider infrastructure for cross-account
+  AWS PrivateLink connectivity to MariaDB.
+
+Parameters:
+  ConsumerAccountId:
+    Type: String
+    Default: '846904544394'
+    AllowedPattern: '^\d{12}$'
+    Description: AWS account ID of the consumer.
+
+  ConsumerVpcCidr:
+    Type: String
+    Default: '172.31.0.0/16'
+    Description: Consumer VPC CIDR.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type for MariaDB.
+
+Resources:
+
+  # 1. Provider VPC
+  ProviderVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: mysqlprovidervpc
+
+  # 2. Provider subnets
+  ProviderSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mysqlprovidersubnet-a
+
+  ProviderSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProviderVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mysqlprovidersubnet-b
+
+  # 3. Route table
+  ProviderRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProviderVpc
+      Tags:
+        - Key: Name
+          Value: mysql-provider-rt
+
+  ProviderSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProviderSubnetA
+      RouteTableId: !Ref ProviderRouteTable
+
+  ProviderSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProviderSubnetB
+      RouteTableId: !Ref ProviderRouteTable
+
+  # 4. IAM role for Session Manager
+  ProviderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: mysql-provider-ec2-role
+
+  ProviderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ProviderInstanceRole
+
+  # 5. Security group for SSM endpoints
+  ProviderSsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS access to SSM endpoints
+      VpcId: !Ref ProviderVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysql-provider-ssm-endpoint-sg
+
+  # 6. SSM interface endpoint
+  ProviderSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProviderVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ProviderSubnetA
+        - !Ref ProviderSubnetB
+      SecurityGroupIds:
+        - !Ref ProviderSsmEndpointSecurityGroup
+
+  # 7. SSM Messages interface endpoint
+  ProviderSsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProviderVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ProviderSubnetA
+        - !Ref ProviderSubnetB
+      SecurityGroupIds:
+        - !Ref ProviderSsmEndpointSecurityGroup
+
+  # 8. S3 gateway endpoint
+  ProviderS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProviderVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref ProviderRouteTable
+
+  # 9. NLB security group
+  ProviderNlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow TCP 3306 from consumer VPC CIDR
+      VpcId: !Ref ProviderVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref ConsumerVpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysql-nlb-sg
+
+  # 10. MariaDB EC2 security group
+  ProviderEc2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MariaDB traffic from NLB security group
+      VpcId: !Ref ProviderVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ProviderNlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysqlprovider-sg
+
+  # 11. Private EC2 instance with MariaDB
+  ProviderDatabaseInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ProviderS3Endpoint
+      - ProviderSsmEndpoint
+      - ProviderSsmMessagesEndpoint
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ProviderInstanceProfile
+      SubnetId: !Ref ProviderSubnetA
+      SecurityGroupIds:
+        - !Ref ProviderEc2SecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/mariadb-setup.log | logger -t user-data -s 2>/dev/console) 2>&1
+          dnf makecache
+          dnf install -y mariadb105-server
+          systemctl enable --now mariadb
+      Tags:
+        - Key: Name
+          Value: mysqlproviderec2
+
+  # 12. Target group
+  ProviderTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: mysql-tcp-tg
+      VpcId: !Ref ProviderVpc
+      Protocol: TCP
+      Port: 3306
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProviderDatabaseInstance
+          Port: 3306
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckPort: traffic-port
+      Tags:
+        - Key: Name
+          Value: mysql-tcp-tg
+
+  # 13. Internal Network Load Balancer
+  ProviderNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: mysql-tcp-nlb
+      Type: network
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref ProviderSubnetA
+        - !Ref ProviderSubnetB
+      SecurityGroups:
+        - !Ref ProviderNlbSecurityGroup
+      EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic: 'on'
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: mysql-tcp-nlb
+
+  # 14. NLB listener
+  ProviderNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ProviderNetworkLoadBalancer
+      Protocol: TCP
+      Port: 3306
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProviderTargetGroup
+
+  # 15. PrivateLink endpoint service
+  ProviderEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    DependsOn: ProviderNlbListener
+    Properties:
+      AcceptanceRequired: true
+      NetworkLoadBalancerArns:
+        - !Ref ProviderNetworkLoadBalancer
+
+  # 16. Authorize consumer account
+  ProviderEndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref ProviderEndpointService
+      AllowedPrincipals:
+        - !Sub 'arn:${AWS::Partition}:iam::${ConsumerAccountId}:root'
+
+Outputs:
+  ProviderVpcId:
+    Description: Provider VPC ID
+    Value: !Ref ProviderVpc
+
+  ProviderSubnetAId:
+    Description: Provider subnet A ID
+    Value: !Ref ProviderSubnetA
+
+  ProviderSubnetBId:
+    Description: Provider subnet B ID
+    Value: !Ref ProviderSubnetB
+
+  ProviderInstanceId:
+    Description: MariaDB EC2 instance ID
+    Value: !Ref ProviderDatabaseInstance
+
+  ProviderNlbArn:
+    Description: Internal NLB ARN
+    Value: !Ref ProviderNetworkLoadBalancer
+
+  ProviderNlbDnsName:
+    Description: Internal NLB DNS name
+    Value: !GetAtt ProviderNetworkLoadBalancer.DNSName
+
+  ProviderTargetGroupArn:
+    Description: Database target group ARN
+    Value: !Ref ProviderTargetGroup
+
+  ProviderEndpointServiceId:
+    Description: PrivateLink endpoint service ID
+    Value: !Ref ProviderEndpointService
+
+  ProviderEndpointServiceName:
+    Description: Service name for Account B
+    Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${ProviderEndpointService}'

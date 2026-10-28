@@ -1,0 +1,219 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Account B consumer infrastructure for cross-account AWS PrivateLink to MariaDB
+
+Parameters:
+  ProviderEndpointServiceName:
+    Type: String
+    Default: com.amazonaws.vpce.us-east-1.vpce-svc-0b47678cf1dbef74b
+    Description: Endpoint service name exported by Account A
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+
+Resources:
+  ConsumerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-vpc
+
+  ConsumerSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 172.31.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-subnet-a
+
+  ConsumerSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 172.31.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-subnet-b
+
+  ConsumerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-private-rt
+
+  ConsumerSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ConsumerSubnetA
+      RouteTableId: !Ref ConsumerRouteTable
+
+  ConsumerSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ConsumerSubnetB
+      RouteTableId: !Ref ConsumerRouteTable
+
+  ConsumerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the private consumer EC2 instance
+      VpcId: !Ref ConsumerVpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-ec2-sg
+
+  ConsumerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MariaDB access from the consumer EC2 instance
+      VpcId: !Ref ConsumerVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ConsumerInstanceSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-endpoint-sg
+
+  ConsumerSsmEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from the consumer VPC to SSM endpoints
+      VpcId: !Ref ConsumerVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 172.31.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-ssm-endpoints-sg
+
+  ConsumerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-ec2-role
+
+  ConsumerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ConsumerInstanceRole
+
+  ConsumerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ConsumerInstanceProfile
+      SubnetId: !Ref ConsumerSubnetA
+      SecurityGroupIds:
+        - !Ref ConsumerInstanceSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: mysql-consumer-ec2
+
+  ConsumerSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ConsumerSubnetA
+        - !Ref ConsumerSubnetB
+      SecurityGroupIds:
+        - !Ref ConsumerSsmEndpointSecurityGroup
+
+  ConsumerSsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ConsumerSubnetA
+        - !Ref ConsumerSubnetB
+      SecurityGroupIds:
+        - !Ref ConsumerSsmEndpointSecurityGroup
+
+  ConsumerMariaDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      VpcEndpointType: Interface
+      ServiceName: !Ref ProviderEndpointServiceName
+      PrivateDnsEnabled: false
+      SubnetIds:
+        - !Ref ConsumerSubnetA
+        - !Ref ConsumerSubnetB
+      SecurityGroupIds:
+        - !Ref ConsumerEndpointSecurityGroup
+
+Outputs:
+  ConsumerVpcId:
+    Description: Consumer VPC ID
+    Value: !Ref ConsumerVpc
+
+  ConsumerInstanceId:
+    Description: Consumer EC2 instance ID
+    Value: !Ref ConsumerInstance
+
+  ConsumerSubnetAId:
+    Description: Consumer subnet A ID
+    Value: !Ref ConsumerSubnetA
+
+  ConsumerSubnetBId:
+    Description: Consumer subnet B ID
+    Value: !Ref ConsumerSubnetB
+
+  ConsumerMariaDbEndpointId:
+    Description: Interface endpoint ID for Account A MariaDB
+    Value: !Ref ConsumerMariaDbEndpoint
+
+  ProviderEndpointServiceName:
+    Description: Account A endpoint service used by this endpoint
+    Value: !Ref ProviderEndpointServiceName
