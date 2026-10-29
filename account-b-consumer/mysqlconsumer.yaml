@@ -5,7 +5,7 @@ Description: Account B consumer infrastructure for cross-account AWS PrivateLink
 Parameters:
   ProviderEndpointServiceName:
     Type: String
-    Default: com.amazonaws.vpce.us-east-1.vpce-svc-0b47678cf1dbef74b
+    Default: com.amazonaws.vpce.us-east-1.vpce-svc-08e80ed662c7091ef
     Description: Endpoint service name exported by Account A
 
   InstanceType:
@@ -67,6 +67,16 @@ Resources:
     Properties:
       SubnetId: !Ref ConsumerSubnetB
       RouteTableId: !Ref ConsumerRouteTable
+
+  # Private access to S3-hosted Amazon Linux package repositories
+  ConsumerS3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref ConsumerRouteTable
 
   ConsumerInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -213,6 +223,10 @@ Outputs:
   ConsumerMariaDbEndpointId:
     Description: Interface endpoint ID for Account A MariaDB
     Value: !Ref ConsumerMariaDbEndpoint
+
+  ConsumerS3GatewayEndpointId:
+    Description: S3 gateway endpoint ID for private package repository access
+    Value: !Ref ConsumerS3GatewayEndpoint
 
   ProviderEndpointServiceName:
     Description: Account A endpoint service used by this endpoint

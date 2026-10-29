@@ -1,8 +1,9 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Account A provider infrastructure for cross-account
-  AWS PrivateLink connectivity to MariaDB.
+Description: >-
+  Account A provider infrastructure for cross-account AWS PrivateLink
+  connectivity to MariaDB, including database initialization and
+  secure application credentials.
 
 Parameters:
   ConsumerAccountId:
@@ -13,7 +14,7 @@ Parameters:
 
   ConsumerVpcCidr:
     Type: String
-    Default: '172.31.0.0/16'
+    Default: 172.31.0.0/16
     Description: Consumer VPC CIDR.
 
   InstanceType:
@@ -25,9 +26,19 @@ Parameters:
       - t3.medium
     Description: EC2 instance type for MariaDB.
 
-Resources:
+  DatabaseName:
+    Type: String
+    Default: privatelink_demo
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9_]*$'
+    Description: Application database name.
 
-  # 1. Provider VPC
+  DatabaseUsername:
+    Type: String
+    Default: privatelink_app
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9_]{0,31}$'
+    Description: Dedicated application database user.
+
+Resources:
   ProviderVpc:
     Type: AWS::EC2::VPC
     Properties:
@@ -38,13 +49,14 @@ Resources:
         - Key: Name
           Value: mysqlprovidervpc
 
-  # 2. Provider subnets
   ProviderSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref ProviderVpc
       CidrBlock: 10.0.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
@@ -55,13 +67,14 @@ Resources:
     Properties:
       VpcId: !Ref ProviderVpc
       CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
           Value: mysqlprovidersubnet-b
 
-  # 3. Route table
   ProviderRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -82,7 +95,6 @@ Resources:
       SubnetId: !Ref ProviderSubnetB
       RouteTableId: !Ref ProviderRouteTable
 
-  # 4. IAM role for Session Manager
   ProviderInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -105,11 +117,38 @@ Resources:
       Roles:
         - !Ref ProviderInstanceRole
 
-  # 5. Security group for SSM endpoints
+  ProviderDatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Credentials for the PrivateLink MariaDB application user
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DatabaseUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+        IncludeSpace: false
+      Tags:
+        - Key: Name
+          Value: privatelink-demo-db-credentials
+
+  ProviderDatabaseSecretAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReadProviderDatabaseCredentials
+      Roles:
+        - !Ref ProviderInstanceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref ProviderDatabaseSecret
+
   ProviderSsmEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: HTTPS access to SSM endpoints
+      GroupDescription: HTTPS access to private AWS service endpoints
       VpcId: !Ref ProviderVpc
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -121,9 +160,8 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: mysql-provider-ssm-endpoint-sg
+          Value: mysql-provider-service-endpoints-sg
 
-  # 6. SSM interface endpoint
   ProviderSsmEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -137,7 +175,6 @@ Resources:
       SecurityGroupIds:
         - !Ref ProviderSsmEndpointSecurityGroup
 
-  # 7. SSM Messages interface endpoint
   ProviderSsmMessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -151,7 +188,19 @@ Resources:
       SecurityGroupIds:
         - !Ref ProviderSsmEndpointSecurityGroup
 
-  # 8. S3 gateway endpoint
+  ProviderSecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProviderVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref ProviderSubnetA
+        - !Ref ProviderSubnetB
+      SecurityGroupIds:
+        - !Ref ProviderSsmEndpointSecurityGroup
+
   ProviderS3Endpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -161,7 +210,6 @@ Resources:
       RouteTableIds:
         - !Ref ProviderRouteTable
 
-  # 9. NLB security group
   ProviderNlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -179,7 +227,6 @@ Resources:
         - Key: Name
           Value: mysql-nlb-sg
 
-  # 10. MariaDB EC2 security group
   ProviderEc2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -197,13 +244,14 @@ Resources:
         - Key: Name
           Value: mysqlprovider-sg
 
-  # 11. Private EC2 instance with MariaDB
-  ProviderDatabaseInstance:
+  ProviderDatabaseInstanceV2:
     Type: AWS::EC2::Instance
     DependsOn:
       - ProviderS3Endpoint
       - ProviderSsmEndpoint
       - ProviderSsmMessagesEndpoint
+      - ProviderSecretsManagerEndpoint
+      - ProviderDatabaseSecretAccessPolicy
     Properties:
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
@@ -213,19 +261,80 @@ Resources:
         - !Ref ProviderEc2SecurityGroup
       MetadataOptions:
         HttpTokens: required
+        HttpEndpoint: enabled
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -euxo pipefail
+          set -euo pipefail
           exec > >(tee /var/log/mariadb-setup.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+          echo "Installing MariaDB..."
           dnf makecache
           dnf install -y mariadb105-server
+
           systemctl enable --now mariadb
+
+          echo "Waiting for MariaDB to become ready..."
+          for attempt in $(seq 1 30); do
+            if mariadb-admin ping --silent; then
+              break
+            fi
+            sleep 2
+          done
+
+          mariadb-admin ping --silent
+
+          echo "Retrieving database credentials from Secrets Manager..."
+          SECRET_JSON=""
+          for attempt in $(seq 1 30); do
+            if SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id '${ProviderDatabaseSecret}' --query SecretString --output text --region '${AWS::Region}' 2>/dev/null); then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$SECRET_JSON" ]; then
+            echo "ERROR: Could not retrieve database credentials."
+            exit 1
+          fi
+
+          DB_PASSWORD=$(printf '%s' "$SECRET_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+
+          echo "Creating application database and restricted user..."
+          mariadb <<SQL
+          CREATE DATABASE IF NOT EXISTS ${DatabaseName};
+
+          CREATE USER IF NOT EXISTS '${DatabaseUsername}'@'%'
+            IDENTIFIED BY '$DB_PASSWORD';
+
+          ALTER USER '${DatabaseUsername}'@'%'
+            IDENTIFIED BY '$DB_PASSWORD';
+
+          GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER
+            ON ${DatabaseName}.* TO '${DatabaseUsername}'@'%';
+
+          USE ${DatabaseName};
+
+          CREATE TABLE IF NOT EXISTS connection_test (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            message VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+
+          INSERT INTO connection_test (message)
+          SELECT 'PrivateLink database initialized'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM connection_test
+            WHERE message = 'PrivateLink database initialized'
+          );
+          SQL
+
+          unset DB_PASSWORD SECRET_JSON
+          echo "MariaDB database initialization completed."
       Tags:
         - Key: Name
           Value: mysqlproviderec2
 
-  # 12. Target group
   ProviderTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -235,7 +344,7 @@ Resources:
       Port: 3306
       TargetType: instance
       Targets:
-        - Id: !Ref ProviderDatabaseInstance
+        - Id: !Ref ProviderDatabaseInstanceV2
           Port: 3306
       HealthCheckEnabled: true
       HealthCheckProtocol: TCP
@@ -244,7 +353,6 @@ Resources:
         - Key: Name
           Value: mysql-tcp-tg
 
-  # 13. Internal Network Load Balancer
   ProviderNetworkLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -265,7 +373,6 @@ Resources:
         - Key: Name
           Value: mysql-tcp-nlb
 
-  # 14. NLB listener
   ProviderNlbListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -276,7 +383,6 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ProviderTargetGroup
 
-  # 15. PrivateLink endpoint service
   ProviderEndpointService:
     Type: AWS::EC2::VPCEndpointService
     DependsOn: ProviderNlbListener
@@ -285,7 +391,6 @@ Resources:
       NetworkLoadBalancerArns:
         - !Ref ProviderNetworkLoadBalancer
 
-  # 16. Authorize consumer account
   ProviderEndpointServicePermissions:
     Type: AWS::EC2::VPCEndpointServicePermissions
     Properties:
@@ -307,8 +412,8 @@ Outputs:
     Value: !Ref ProviderSubnetB
 
   ProviderInstanceId:
-    Description: MariaDB EC2 instance ID
-    Value: !Ref ProviderDatabaseInstance
+    Description: New MariaDB EC2 instance ID
+    Value: !Ref ProviderDatabaseInstanceV2
 
   ProviderNlbArn:
     Description: Internal NLB ARN
@@ -329,3 +434,15 @@ Outputs:
   ProviderEndpointServiceName:
     Description: Service name for Account B
     Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${ProviderEndpointService}'
+
+  ProviderDatabaseName:
+    Description: Initialized application database
+    Value: !Ref DatabaseName
+
+  ProviderDatabaseUsername:
+    Description: Application database username
+    Value: !Ref DatabaseUsername
+
+  ProviderDatabaseSecretArn:
+    Description: Secrets Manager ARN containing the generated credentials
+    Value: !Ref ProviderDatabaseSecret
